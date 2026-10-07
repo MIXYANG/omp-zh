@@ -330,25 +330,17 @@ const listBackupEntries = async (): Promise<{ dir: string; name: string; mtimeMs
 };
 
 /** Path of the pristine bundle, wherever it currently lives. */
-const pristinePath = async (): Promise<string | null> => {
-	for (const dir of backupDirs()) {
-		const candidate = path.join(dir, "cli.js.orig-pristine");
-		if (await Bun.file(candidate).exists()) return candidate;
-	}
-	return null;
-};
-
 /**
- * Newest unpatched snapshot sitting next to an explicitly named bundle.
+ * Path of the pristine (unpatched) bundle, wherever it lives.
  *
- * `check --code <path>` is used by CI against a freshly downloaded package, but
- * a maintainer may point it at an installed (already patched) file. Scanning
- * the patched text makes every anchor miss, which reads as a real regression.
- * Fall back to the sibling `.omp-zh-backup/` the patcher wrote, preferring the
- * newest snapshot so the report describes the current upstream version.
+ * The patcher writes timestamped snapshots (`cli.js.orig-<iso>`), and only an
+ * older release ever wrote the fixed name `cli.js.orig-pristine`. Tools that
+ * need English originals (`report`, `probe`) therefore used to fail on any
+ * install created by the current patcher. Fall back to the newest timestamped
+ * snapshot, which mirrors the currently installed version.
  */
-const newestPristineBeside = async (target: string): Promise<string | null> => {
-	const dir = path.join(path.dirname(target), ".omp-zh-backup");
+/** Newest `cli.js.orig-*` snapshot inside `dir`, or null when there is none. */
+const newestBackupIn = async (dir: string): Promise<string | null> => {
 	let names: string[] = [];
 	try {
 		names = await Array.fromAsync(new Bun.Glob("cli.js.orig-*").scan({ cwd: dir }));
@@ -364,6 +356,30 @@ const newestPristineBeside = async (target: string): Promise<string | null> => {
 	}
 	return best?.path ?? null;
 };
+
+const pristinePath = async (): Promise<string | null> => {
+	for (const dir of backupDirs()) {
+		const candidate = path.join(dir, "cli.js.orig-pristine");
+		if (await Bun.file(candidate).exists()) return candidate;
+	}
+	let best: { path: string; mtime: number } | null = null;
+	for (const entry of await listBackupEntries()) {
+		if (!best || entry.mtimeMs > best.mtime) best = { path: path.join(entry.dir, entry.name), mtime: entry.mtimeMs };
+	}
+	return best?.path ?? null;
+};
+
+/**
+ * Newest unpatched snapshot sitting next to an explicitly named bundle.
+ *
+ * `check --code <path>` is used by CI against a freshly downloaded package, but
+ * a maintainer may point it at an installed (already patched) file. Scanning
+ * the patched text makes every anchor miss, which reads as a real regression.
+ * Fall back to the sibling `.omp-zh-backup/` the patcher wrote, preferring the
+ * newest snapshot so the report describes the current upstream version.
+ */
+const newestPristineBeside = (target: string): Promise<string | null> =>
+	newestBackupIn(path.join(path.dirname(target), ".omp-zh-backup"));
 
 /**
  * Copy every backup found in a legacy location into the primary
@@ -1972,6 +1988,61 @@ const probe = async (keys: string[]): Promise<void> => {
 };
 
 /**
+ * `probe --keys <file>` — batch verdicts for a candidate list.
+ *
+ * `tools/translate.ts` is about to spend model calls on a gap list, and some
+ * gap keys can never be rewritten: the same text also sits in a logic/identity
+ * position, so `decideAll` bans the key wholesale and adding a dictionary entry
+ * changes nothing. Translating those wastes calls and pollutes the dictionary
+ * with entries that are inert forever. This prints the real verdict per key so
+ * the caller can drop them *before* translating.
+ *
+ * Candidate keys are not in the dictionary yet, and `scanBundle` only collects
+ * dictionary-matched literals — so a plain scan reports "no occurrences" for
+ * every candidate. The verdicts are therefore computed against the dictionary
+ * with the candidates temporarily injected, which is exactly the state that
+ * would exist after translating them. Nothing is written: the merged table
+ * lives in memory only.
+ *
+ * Reads a JSON array of keys (or a gap file with `.entries[].key`) from the
+ * path given after `--keys`, writes `{source, verdicts[]}` to stdout.
+ */
+const probeBatch = async (keysPath: string): Promise<void> => {
+	await migrateBackups();
+	const raw = await Bun.file(keysPath).json() as unknown;
+	const keys: string[] = Array.isArray(raw)
+		? (raw as string[])
+		: ((raw as { entries?: { key?: string }[] }).entries ?? []).map(e => e.key ?? "").filter(k => k !== "");
+	const dict = await loadDict();
+	const pristine = await pristinePath();
+	if (pristine === null) {
+		// Without English originals every verdict would be wrong; fail loud
+		// rather than silently reporting "everything translatable".
+		throw new Error(`pristine backup missing in ${backupDirs().join(" or ")}`);
+	}
+	const code = await Bun.file(pristine).text();
+	// Inject a placeholder so the scanner sees each candidate as a dictionary
+	// key. The value never reaches the output; only the role classification of
+	// its occurrences matters here.
+	const probeDict: Record<string, string> = { ...dict };
+	for (const key of keys) if (!Object.hasOwn(probeDict, key)) probeDict[key] = key;
+	const { occurrences } = scanBundle(code, probeDict);
+	const verdicts = decideAll(occurrences, probeDict);
+	const byKey = new Map(verdicts.map(v => [v.key, v]));
+	const out = keys.map(key => {
+		const v = byKey.get(key);
+		return {
+			key,
+			reason: v?.reason ?? "no-occurrence",
+			translatable: (v?.translate.length ?? 0) > 0,
+			translate: v?.translate.length ?? 0,
+			skipped: v?.skipped.length ?? 0,
+		};
+	});
+	process.stdout.write(JSON.stringify({ source: pristine, verdicts: out }, null, 2) + "\n");
+};
+
+/**
  * `check [--code <path>]` — dry-run the full pipeline against a bundle
  * without writing anything. Used by CI to probe a fresh upstream release:
  * exits non-zero when anchors cannot be adapted, and prints the untranslated
@@ -2166,7 +2237,19 @@ else if (command === "apply") await apply();
 else if (command === "verify") await verify();
 else if (command === "restore") await restore();
 else if (command === "list") await listBackups();
-else if (command === "probe") await probe(process.argv.slice(3));
+else if (command === "probe") {
+	const keysIdx = process.argv.indexOf("--keys");
+	if (keysIdx !== -1) {
+		const keysPath = process.argv[keysIdx + 1];
+		if (!keysPath) {
+			console.error("usage: bun patch.ts probe --keys <keys.json>");
+			process.exit(1);
+		}
+		await probeBatch(keysPath);
+	} else {
+		await probe(process.argv.slice(3));
+	}
+}
 else {
 	console.error(`unknown command: ${command} (report|apply|verify|restore|list|probe|path|check|migrate|doctor)`);
 	process.exit(1);

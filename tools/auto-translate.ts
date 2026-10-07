@@ -180,21 +180,80 @@ const chat = async (ep: Endpoint, prompt: string, temperature = 0.2): Promise<st
 		body: JSON.stringify({
 			model: MODEL,
 			messages: [{ role: "user", content: prompt }],
-			max_tokens: 4000,
+			// Deliberately no max_tokens. The endpoint's own default is the
+			// right ceiling: a reasoning model spends budget on hidden thinking
+			// before emitting any content, so every cap we picked either
+			// truncated the JSON mid-object (whole batch lost) or starved the
+			// answer entirely (`finish_reason: "length"`, empty content). The
+			// reply length is bounded by the batch anyway.
 			temperature,
 		}),
 	});
 	if (!res.ok) throw new Error(`endpoint ${res.status}: ${(await res.text()).slice(0, 300)}`);
-	const data = await res.json() as { choices?: { message?: { content?: string } }[] };
-	return data.choices?.[0]?.message?.content ?? "";
+	const data = await res.json() as {
+		choices?: { message?: { content?: string }; finish_reason?: string }[];
+		usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
+	};
+	const choice = data.choices?.[0];
+	const content = choice?.message?.content ?? "";
+	if (content.trim() === "") {
+		// A reasoning model spends output budget on hidden thinking before it
+		// emits any content. We no longer send max_tokens (the endpoint default
+		// is the sane ceiling), so an empty answer with a "length" finish now
+		// means the endpoint itself capped the reply — a gateway-side setting,
+		// not something this tool can fix by asking for more.
+		const reasoning = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+		const used = data.usage?.completion_tokens ?? 0;
+		if (choice?.finish_reason === "length") {
+			throw new Error(
+				`endpoint truncated the reply (finish_reason=length, completion_tokens=${used}, reasoning_tokens=${reasoning}) — ` +
+				`the endpoint's own output cap is too low; lower --batch so the reply fits`,
+			);
+		}
+		throw new Error(`endpoint returned empty content (finish_reason=${choice?.finish_reason ?? "?"}, completion_tokens=${used})`);
+	}
+	return content;
 };
 
 const parseJsonObject = (text: string): Record<string, string> => {
 	let t = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
 	const start = t.indexOf("{");
-	const end = t.lastIndexOf("}");
-	if (start === -1 || end === -1) throw new Error(`model returned no JSON: ${t.slice(0, 200)}`);
-	return JSON.parse(t.slice(start, end + 1)) as Record<string, string>;
+	if (start === -1) throw new Error(`model returned no JSON: ${t.slice(0, 200)}`);
+	// Parse with a brace/bracket/string-aware scan rather than `lastIndexOf("}")`.
+	// A truncated response still contains inner braces, so lastIndexOf handed
+	// JSON.parse a slice that ended mid-object and produced a confusing syntax
+	// error — or worse, silently dropped every entry after the cut. Walking the
+	// text finds the first *balanced* object, and an unterminated one is
+	// reported as truncation instead of being mistaken for a model failure.
+	let depth = 0;
+	let inStr = false;
+	let esc = false;
+	for (let i = start; i < t.length; i++) {
+		const c = t[i];
+		if (inStr) {
+			if (esc) { esc = false; continue; }
+			if (c === "\\") { esc = true; continue; }
+			if (c === '"') inStr = false;
+			continue;
+		}
+		if (c === '"') { inStr = true; continue; }
+		if (c === "{") depth++;
+		else if (c === "}") {
+			depth--;
+			if (depth === 0) {
+				const slice = t.slice(start, i + 1);
+				try {
+					return JSON.parse(slice) as Record<string, string>;
+				} catch (e) {
+					throw new Error(`model returned malformed JSON: ${e instanceof Error ? e.message : e}\n  ${slice.slice(0, 300)}`);
+				}
+			}
+		}
+	}
+	throw new Error(
+		`model response was truncated (unbalanced JSON, ${t.length} chars) — ` +
+		`raise max_tokens or lower --batch\n  ${t.slice(0, 300)}`,
+	);
 };
 
 const translateBatch = async (ep: Endpoint, entries: { key: string; snippet: string }[]): Promise<Record<string, string>> =>
@@ -283,6 +342,11 @@ const run = async (): Promise<void> => {
 
 	const ep = await resolveEndpoint();
 	let candidates: Candidate[] = [];
+	// Every batch failure used to be swallowed by `continue`, so a dead
+	// endpoint produced an empty candidate list and the caller reported
+	// success — a maintainer would see the run "finish" and ship nothing.
+	// Count the losses and fail loud when the whole run produced nothing.
+	let failedBatches = 0;
 	for (let i = 0; i < todo.length; i += BATCH) {
 		const batch = todo.slice(i, i + BATCH);
 		console.log(`  batch ${Math.floor(i / BATCH) + 1}/${Math.ceil(todo.length / BATCH)} (${batch.length} strings)`);
@@ -290,6 +354,7 @@ const run = async (): Promise<void> => {
 		try {
 			out = await translateBatch(ep, batch);
 		} catch (e) {
+			failedBatches++;
 			console.error(`  batch failed: ${e instanceof Error ? e.message : e}`);
 			continue;
 		}
@@ -301,6 +366,16 @@ const run = async (): Promise<void> => {
 			}
 			candidates.push({ key: entry.key, zh, role: entry.role, count: entry.count, flags: validate(entry.key, zh) });
 		}
+	}
+	if (failedBatches > 0) {
+		const total = Math.ceil(todo.length / BATCH);
+		console.error(`\n${failedBatches}/${total} 批次翻译失败（端点：${ep.baseUrl}）`);
+	}
+	if (candidates.length === 0 && todo.length > 0) {
+		throw new Error(
+			`没有产出任何候选：${todo.length} 条全部翻译失败（端点：${ep.baseUrl}）\n` +
+			`  检查端点可达性与凭据：--endpoint / OMP_ZH_ENDPOINT / ~/.omp/agent/models.yml`,
+		);
 	}
 
 	// ── self-review pass ──────────────────────────────────────────────────

@@ -42,16 +42,35 @@ const STOP_FOR_REVIEW = has("--review") || has("-r");
 const DO_PUSH = has("--push");
 const DRY_RUN = has("--dry-run");
 
-const run = async (cmd: string[], opts: { cwd?: string; inherit?: boolean } = {}): Promise<{ code: number; out: string }> => {
+/**
+ * Run a subprocess, keeping stdout and stderr apart.
+ *
+ * They must not be concatenated: `patch.ts probe --keys` writes a JSON
+ * document on stdout while its module-load progress (sidecar materialisation,
+ * launcher linking) goes to stderr, so a merged stream is unparseable. `out`
+ * carries stdout, `err` carries stderr, and `both` is provided for the callers
+ * that only want to show a combined log.
+ */
+const run = async (
+	cmd: string[],
+	opts: { cwd?: string; inherit?: boolean } = {},
+): Promise<{ code: number; out: string; err: string; both: string }> => {
 	const proc = Bun.spawn(cmd, {
 		cwd: opts.cwd ?? WORK,
 		stdout: opts.inherit ? "inherit" : "pipe",
 		stderr: opts.inherit ? "inherit" : "pipe",
 		env: process.env,
 	});
-	const out = opts.inherit ? "" : await new Response(proc.stdout).text() + await new Response(proc.stderr).text();
+	let out = "";
+	let err = "";
+	if (!opts.inherit) {
+		[out, err] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
+	}
 	const code = await proc.exited;
-	return { code, out };
+	return { code, out, err, both: out + err };
 };
 
 const step = (n: number, text: string): void => console.log(`\n\u001b[1m[${n}/6]\u001b[0m ${text}`);
@@ -62,15 +81,59 @@ step(1, "扫描缺口（词典未覆盖的界面英文）");
 const scanArgs = ["bun", path.join(WORK, "tools", "extract-gaps.ts"), "--json", GAPS_PATH];
 const scan = await run(scanArgs);
 if (scan.code !== 0) {
-	console.error(scan.out.slice(-2000));
+	console.error(scan.both.slice(-2000));
 	process.exit(1);
 }
-const gaps = JSON.parse(await Bun.file(GAPS_PATH).text()) as { entries: { key: string }[] };
+const gaps = JSON.parse(await Bun.file(GAPS_PATH).text()) as { entries: { key: string; role: string; count: number; snippet: string }[] };
 if (gaps.entries.length === 0) {
 	console.log("没有缺口——词典已覆盖当前产物的全部界面字符串。");
 	process.exit(0);
 }
 console.log(`发现 ${gaps.entries.length} 条待翻译字符串`);
+
+// Filter by whether the key can actually be rewritten *before* paying for
+// translation. A gap key whose text also sits in a logic/identity position is
+// banned wholesale by the patcher (`decideAll`), so a dictionary entry for it
+// is inert forever — translating it wastes model calls and leaves dead weight
+// in dict-extra.json. Ask the patcher for the real verdicts instead of
+// guessing from the shape of the string.
+const VERDICTS_PATH = path.join(WORK, "report-verdicts.json");
+const keysPath = path.join(WORK, "report-gap-keys.json");
+await Bun.write(keysPath, JSON.stringify(gaps.entries.map(e => e.key)));
+const verdictRun = await run(["bun", path.join(WORK, "patch.ts"), "probe", "--keys", keysPath]);
+if (verdictRun.code !== 0) {
+	console.error(verdictRun.both.slice(-2000));
+	process.exit(1);
+}
+// `patch.ts` writes the JSON document on stdout and its progress on stderr,
+// so stdout is exactly the payload (pretty-printed, hence multi-line) and can
+// be parsed whole.
+let translatable: Set<string>;
+try {
+	const parsed = JSON.parse(verdictRun.out) as { verdicts: { key: string; translatable: boolean }[] };
+	translatable = new Set(parsed.verdicts.filter(v => v.translatable).map(v => v.key));
+	await Bun.write(VERDICTS_PATH, JSON.stringify(parsed, null, 2));
+} catch (e) {
+	console.error(`无法解析补丁器的判定结果：${e instanceof Error ? e.message : e}`);
+	console.error(verdictRun.out.slice(0, 500));
+	console.error(verdictRun.err.slice(-500));
+	process.exit(1);
+}
+const skippedKeys = gaps.entries.filter(e => !translatable.has(e.key));
+if (skippedKeys.length > 0) {
+	console.log(`其中 ${skippedKeys.length} 条永远无法汉化（同一文本也出现在逻辑/身份位，补丁器整条跳过），已排除：`);
+	for (const e of skippedKeys.slice(0, 10)) {
+		console.log(`  ✗ ${JSON.stringify(e.key).slice(0, 100)}`);
+	}
+	if (skippedKeys.length > 10) console.log(`  … 其余 ${skippedKeys.length - 10} 条见 ${VERDICTS_PATH}`);
+}
+gaps.entries = gaps.entries.filter(e => translatable.has(e.key));
+if (gaps.entries.length === 0) {
+	console.log("排除后没有可翻译的条目。");
+	process.exit(0);
+}
+console.log(`实际送翻：${gaps.entries.length} 条`);
+await Bun.write(GAPS_PATH, JSON.stringify(gaps, null, 2));
 
 // ── 2. translate ────────────────────────────────────────────────────────────
 
@@ -121,7 +184,7 @@ if (STOP_FOR_REVIEW) {
 
 step(4, "并入词典 dict-extra.json");
 const acc = await run(["bun", path.join(WORK, "tools", "auto-translate.ts"), "--accept"]);
-console.log(acc.out.trim());
+console.log(acc.both.trim());
 if (acc.code !== 0) process.exit(acc.code);
 
 // ── 5. verify ───────────────────────────────────────────────────────────────
@@ -129,11 +192,11 @@ if (acc.code !== 0) process.exit(acc.code);
 step(5, "应用补丁并验证");
 const apply = await run(["./omp-zh.sh", "apply"]);
 if (apply.code !== 0) {
-	console.error(apply.out.slice(-3000));
+	console.error(apply.both.slice(-3000));
 	process.exit(1);
 }
 const test = await run(["./omp-zh.sh", "test"]);
-const summary = test.out.split("\n").filter(l => /helper calls|stray CJK|invariants|not ok|FAIL/.test(l)).join("\n");
+const summary = test.both.split("\n").filter(l => /helper calls|stray CJK|invariants|not ok|FAIL/.test(l)).join("\n");
 console.log(summary);
 if (test.code !== 0) {
 	console.error("\n验证失败——请检查上方输出。此时不要 push。");

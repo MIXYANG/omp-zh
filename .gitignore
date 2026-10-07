@@ -25,3 +25,5 @@ runtime/
 .upstream-state.json
 dict-candidates.json
 report-gaps.json
+report-gap-keys.json
+report-verdicts.json
