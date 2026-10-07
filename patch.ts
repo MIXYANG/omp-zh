@@ -339,6 +339,33 @@ const pristinePath = async (): Promise<string | null> => {
 };
 
 /**
+ * Newest unpatched snapshot sitting next to an explicitly named bundle.
+ *
+ * `check --code <path>` is used by CI against a freshly downloaded package, but
+ * a maintainer may point it at an installed (already patched) file. Scanning
+ * the patched text makes every anchor miss, which reads as a real regression.
+ * Fall back to the sibling `.omp-zh-backup/` the patcher wrote, preferring the
+ * newest snapshot so the report describes the current upstream version.
+ */
+const newestPristineBeside = async (target: string): Promise<string | null> => {
+	const dir = path.join(path.dirname(target), ".omp-zh-backup");
+	let names: string[] = [];
+	try {
+		names = await Array.fromAsync(new Bun.Glob("cli.js.orig-*").scan({ cwd: dir }));
+	} catch {
+		return null;
+	}
+	let best: { path: string; mtime: number } | null = null;
+	for (const name of names) {
+		const full = path.join(dir, name);
+		const stat = await Bun.file(full).stat().catch(() => null);
+		if (!stat) continue;
+		if (!best || stat.mtimeMs > best.mtime) best = { path: full, mtime: stat.mtimeMs };
+	}
+	return best?.path ?? null;
+};
+
+/**
  * Copy every backup found in a legacy location into the primary
  * (bundle-adjacent) directory. Without this, a second clone of the repo sees
  * "汉化已应用" but has no pristine copy to restore from, and `apply` dies.
@@ -1457,6 +1484,7 @@ interface AnchorPlan {
 	anchorOps: { start: number; end: number; wrap: null; kind: "anchor"; name: string; replace: string; adapted?: string }[];
 	obsoleteAnchors: string[];
 	rescuedKeys: Set<string>;
+	rescuedAnchors: string[];
 	rescuedOps: { start: number; end: number; key: string }[];
 	adapted: { name: string; detail: string }[];
 }
@@ -1465,6 +1493,7 @@ const planAnchors = (code: string, occurrences: Map<string, Occurrence[]>, verdi
 	const anchorOps: AnchorPlan["anchorOps"] = [];
 	const obsoleteAnchors: string[] = [];
 	const rescuedKeys = new Set<string>();
+	const rescuedAnchors: string[] = [];
 	const rescuedOps: AnchorPlan["rescuedOps"] = [];
 	const adapted: AnchorPlan["adapted"] = [];
 	const RESCUE_SAFE = (role: string): boolean =>
@@ -1490,6 +1519,7 @@ const planAnchors = (code: string, occurrences: Map<string, Occurrence[]>, verdi
 			const rescuable = keyOccs.length > 0 &&
 				keyOccs.every(({ occs }) => occs.length > 0 && occs.every(o => RESCUE_SAFE(o.role)));
 			if (rescuable) {
+				rescuedAnchors.push(patch.name);
 				for (const { key, occs } of keyOccs) {
 					if (rescuedKeys.has(key)) continue;
 					rescuedKeys.add(key);
@@ -1518,7 +1548,7 @@ const planAnchors = (code: string, occurrences: Map<string, Occurrence[]>, verdi
 		}
 	}
 	console.log(`anchors: ${anchorOps.length} site(s) from ${ANCHOR_PATCHES.length} entries`);
-	return { anchorOps, obsoleteAnchors, rescuedKeys, rescuedOps, adapted };
+	return { anchorOps, obsoleteAnchors, rescuedKeys, rescuedAnchors, rescuedOps, adapted };
 };
 
 const apply = async (): Promise<void> => {
@@ -1543,7 +1573,7 @@ const apply = async (): Promise<void> => {
 	// wildcard matcher in tools/loose-anchor.ts captures the new spellings and
 	// rewrites the replacement on the fly, so an upgrade no longer needs a
 	// hand-edited anchor.
-	const { anchorOps, obsoleteAnchors, rescuedKeys, rescuedOps, adapted: adaptedAnchors } = planAnchors(code, occurrences, verdicts);
+	const { anchorOps, obsoleteAnchors, rescuedKeys, rescuedAnchors, rescuedOps, adapted: adaptedAnchors } = planAnchors(code, occurrences, verdicts);
 
 	// Concatenated hints are invisible to the literal scan; wrap those templates
 	// so the runtime fragment translator can finish the job.
@@ -1708,6 +1738,7 @@ const apply = async (): Promise<void> => {
 		blocks: blocks.map(b => ({ start: b.start, end: b.end, hits: b.hits, lines: b.lines })),
 		anchors: anchorOps.map(a => ({ name: a.name, start: a.start, len: a.end - a.start, adapted: a.adapted ?? null, replace: a.replace })),
 		obsoleteAnchors,
+		rescuedAnchors,
 		rescuedKeys: [...rescuedKeys],
 		valueLabels: Object.keys(VALUE_LABELS).length,
 		ops: ops.length,
@@ -1821,15 +1852,21 @@ const verify = async (): Promise<void> => {
 	// refactored the call site into a display property) and count as applied.
 	let appliedAnchors: { name: string; replace: string }[] | null = null;
 	let obsoleteAnchors: string[] = [];
+	let rescuedAnchors: string[] = [];
 	try {
-		const manifest = await Bun.file(path.join(WORK, "manifest.json")).json() as { anchors?: { name?: string; replace?: string }[]; obsoleteAnchors?: string[] };
+		const manifest = await Bun.file(path.join(WORK, "manifest.json")).json() as {
+			anchors?: { name?: string; replace?: string }[];
+			obsoleteAnchors?: string[];
+			rescuedAnchors?: string[];
+		};
 		if (Array.isArray(manifest.anchors) && manifest.anchors.every(a => typeof a.replace === "string")) {
 			appliedAnchors = manifest.anchors.map(a => ({ name: a.name ?? "?", replace: a.replace as string }));
 		}
 		if (Array.isArray(manifest.obsoleteAnchors)) obsoleteAnchors = manifest.obsoleteAnchors;
+		if (Array.isArray(manifest.rescuedAnchors)) rescuedAnchors = manifest.rescuedAnchors;
 	} catch { /* no manifest: fall back to the literal templates */ }
 	for (const patch of ANCHOR_PATCHES) {
-		if (obsoleteAnchors.includes(patch.name)) { anchorsOk++; continue; }
+		if (obsoleteAnchors.includes(patch.name) || rescuedAnchors.includes(patch.name)) { anchorsOk++; continue; }
 		const candidates = appliedAnchors?.filter(a => a.name === patch.name).map(a => a.replace) ?? [];
 		const hit = code.includes(patch.replace) || candidates.some(c => c.length > 0 && code.includes(c));
 		if (hit) anchorsOk++;
@@ -1944,15 +1981,26 @@ const check = async (codePath?: string, jsonPath?: string): Promise<void> => {
 	const dict = await loadDict();
 	let target = codePath ?? CLI_PATH;
 	let code = await readBundle(target);
-	// An already-patched install would fail every anchor (the spans now carry
-	// helper calls). Probe the pristine backup instead when no explicit path
-	// was given, mirroring `report`.
-	if (codePath === undefined && code.includes(`var ${DICT_VAR}=`)) {
-		const pristine = await pristinePath();
+	// An already-patched bundle fails every anchor (the spans now carry helper
+	// calls) and the resulting "anchor missing" is indistinguishable from a
+	// real upstream regression. Detect the patch marker whatever path was
+	// given, and fall back to the pristine backup next to it. Without this, a
+	// CI job or a maintainer who points `--code` at the installed file gets a
+	// bogus hard failure.
+	if (code.includes(`var ${DICT_VAR}=`)) {
+		const pristine = codePath === undefined
+			? await pristinePath()
+			: await newestPristineBeside(target);
 		if (pristine !== null) {
+			console.log(`(${path.basename(target)} is already patched — checking ${path.basename(pristine)})`);
 			target = pristine;
 			code = await readBundle(target);
-			console.log(`(installed bundle is patched — checking ${path.basename(target)})`);
+		} else {
+			throw new Error(
+				`${target} is already patched and no pristine backup was found beside it\n` +
+				`  restore first: OMP_PKG=… bun patch.ts restore\n` +
+				`  or point --code at an unpatched bundle`,
+			);
 		}
 	}
 	console.log(`checking ${target} (${(code.length / 1e6).toFixed(2)}MB)`);
@@ -1961,7 +2009,7 @@ const check = async (codePath?: string, jsonPath?: string): Promise<void> => {
 	const verdicts = decideAll(occurrences, dict);
 	const blocks = findBlocks(code, dict);
 	const ops = collectOps(verdicts, blocks);
-	const { anchorOps, obsoleteAnchors, rescuedKeys } = planAnchors(code, occurrences, verdicts);
+	const { anchorOps, obsoleteAnchors, rescuedAnchors } = planAnchors(code, occurrences, verdicts);
 	const { ops: tmplOps, missing: tmplMissing } = locateTemplates(code);
 
 	const trans = verdicts.filter(v => v.translate.length > 0);
@@ -2007,7 +2055,15 @@ const check = async (codePath?: string, jsonPath?: string): Promise<void> => {
 		console.log(`\ntemplate targets missing (${tmplMissing.length}):`);
 		for (const t of tmplMissing) console.log(`  ${t}`);
 	}
-	console.log(`\nsummary: anchors ${anchorOps.length} ok, ${obsoleteAnchors.length} obsolete, ${rescuedKeys.size} rescued keys, ${tmplMissing.length} template targets missing, ${gaps.length} dictionary gaps`);
+	// Count covered *entries*, not sites: an `all: true` anchor rewrites several
+	// spans, so adding site counts to the obsolete/rescued tallies overshoots
+	// ANCHOR_PATCHES.length and makes a healthy run look wrong.
+	const anchorEntriesOk = new Set([
+		...anchorOps.map(a => a.name),
+		...obsoleteAnchors,
+		...rescuedAnchors,
+	]).size;
+	console.log(`\nsummary: anchors ${anchorEntriesOk}/${ANCHOR_PATCHES.length} entries ok (${anchorOps.length} sites, ${obsoleteAnchors.length} obsolete, ${rescuedAnchors.length} rescued), ${tmplMissing.length} template targets missing, ${gaps.length} dictionary gaps`);
 	// Template targets are structural, like anchors: each one is a known UI
 	// surface (the settings footer) that no literal rewrite can reach. Losing
 	// one means that surface silently stays English, which is exactly the

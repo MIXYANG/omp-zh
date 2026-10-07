@@ -193,6 +193,9 @@ bun tools/translate.ts --endpoint https://api.openai.com/v1   # 换端点
 > 需要手工介入时，底层工具可单独使用：
 > `bun tools/extract-gaps.ts --json report-gaps.json` 扫描缺口，
 > `bun tools/auto-translate.ts` 生成候选，`--accept` 并入。
+>
+> 扫描/翻译工具自己解析补丁目标（含二进制安装的侧载目录），无需设置任何环境变量；
+> 需要指定时用 `OMP_ZH_SRC`（直接给 `cli.js` 路径）或 `OMP_PKG`（给包目录）。
 
 ## 汉化范围
 
@@ -253,6 +256,24 @@ if (k === __omp_i18n_t("__proto__") || ...) continue;  // 恒为 false，防护�
 `verify` 断言这两类键永不出现在调用点。
 
 ## 更新日志
+
+### 补译工具路径解析 + 被救回锚点的验证误报
+
+`bun tools/translate.ts` 在二进制安装上报 `ENOENT: ~/.bun/install/global/...`：扫描工具写死了
+npm 全局安装路径，而本机汉化产物在侧载目录。现在扫描/翻译工具自动向补丁器询问目标路径，
+二进制安装、npm/bun 全局安装、`OMP_PKG` / `OMP_ZH_SRC` 显式指定都能正确解析。
+
+同时修掉一个会**卡住整个补译流程**的验证误报：上游把面板标题从 `super("History")` 改成
+常量对象后，锚点找不到，但键本身仍能被字面量扫描翻译到 —— 这类「救回」的锚点已正确写入产物，
+`verify` 却仍报 `anchor not applied`，使 `translate.ts` 第 5 步（自动验证）失败、无法发布。
+现在 `planAnchors` 显式返回被救回的锚点名，写入 manifest，`verify` 与 `obsolete` 同等对待。
+
+顺带修掉两处易误判的地方：
+
+- `check --code <已打补丁文件>` 现在自动回退到旁边的原始备份，不再把「已汉化」误报成
+  「锚点全部失配」（CI 里表现为假的硬失败）。
+- `check` 摘要改为按**条目名去重**统计（`61/61 entries ok`）。此前把 `all: true` 锚点的多个
+  写入点相加，会出现 `63/61` 这种自相矛盾的数字。
 
 ### 动态渲染锚点适配 + PATH 自动补全
 

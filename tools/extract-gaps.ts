@@ -11,6 +11,7 @@
 
 import { parse } from "@babel/parser";
 import * as path from "node:path";
+import { existsSync } from "node:fs";
 
 interface AstNode {
 	type: string;
@@ -24,7 +25,25 @@ const isAstNode = (v: unknown): v is AstNode =>
 const WORK = path.resolve(import.meta.dir, "..");
 const PKG = process.env.OMP_PKG ??
 	path.join(process.env.HOME ?? "~", ".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent");
-let CLI_PATH = process.env.OMP_ZH_SRC ?? path.join(PKG, "dist/cli.js");
+const LEGACY_CLI = path.join(PKG, "dist/cli.js");
+const detectCli = (): string => {
+	if (process.env.OMP_ZH_SRC) return process.env.OMP_ZH_SRC;
+	if (process.env.OMP_PKG) return LEGACY_CLI;
+
+	// Keep this tool independent of patch.ts module state: asking `path` to
+	// resolve an official binary can itself materialize a sidecar and print
+	// diagnostics. The gap scanner only needs the already-patched bundle path,
+	// then it switches to the newest pristine backup below.
+	const bun = process.execPath || "bun";
+	const proc = Bun.spawnSync([bun, path.join(WORK, "patch.ts"), "path"], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const resolved = proc.exitCode === 0 ? proc.stdout.toString().trim().split(/\r?\n/).filter(Boolean).at(-1) : undefined;
+	if (resolved && existsSync(resolved)) return resolved;
+	return LEGACY_CLI;
+};
+let CLI_PATH = detectCli();
 
 // The installed bundle is usually patched, which hides the English originals
 // (they are wrapped in helper calls). Scan the pristine backup instead so the
