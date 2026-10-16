@@ -80,6 +80,30 @@ const isNativeBinary = (bytes: Uint8Array): boolean => {
 const SIDECAR_ROOT = path.join(os.homedir(), ".omp-zh", "runtime");
 const LAUNCHER_DIR = path.join(os.homedir(), ".omp-zh", "bin");
 
+const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * Windows installs of a CLI never put a bare `omp` on PATH: npm and bun both
+ * emit wrapper scripts (`omp.cmd`, `omp.ps1`, `omp.bat`) that exec the real JS
+ * entry point. `Bun.which("omp")` therefore returns the *shim*, and treating it
+ * as the bundle makes Babel parse batch syntax and the backup `mkdir` fail with
+ * ENOTDIR. Recognise those extensions and resolve through to the package.
+ */
+const SHIM_EXTENSIONS = [".cmd", ".bat", ".ps1", ".psm1"];
+
+const isShellShim = (p: string): boolean =>
+	SHIM_EXTENSIONS.includes(path.extname(p).toLowerCase());
+
+/**
+ * `chmod` is a no-op on Windows (and throws on some filesystems), while the
+ * executable bit is what keeps the launcher runnable on POSIX. Swallow
+ * failures everywhere: a lost mode bit is never worth aborting a patch for.
+ */
+const makeExecutable = async (p: string, mode = 0o755): Promise<void> => {
+	if (IS_WINDOWS) return;
+	await fs.chmod(p, mode).catch(() => { /* read-only FS or unsupported: ignore */ });
+};
+
 interface OmpTarget {
 	/** Path to the patchable cli.js. */
 	cliPath: string;
@@ -204,7 +228,7 @@ const compileNative = async (cli: string, version: string): Promise<string | und
 		console.error(`预编译失败，继续使用 JS 路径（启动稍慢）：${why}`);
 		return undefined;
 	}
-	await fs.chmod(out, 0o755);
+	await makeExecutable(out);
 	console.error(`已生成字节码二进制：${out}`);
 	return out;
 };
@@ -253,10 +277,24 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`sidecar_js() { echo "$RUNTIME_ROOT/$1/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"; }\n` +
 		`sidecar_native() { echo "$RUNTIME_ROOT/$1/omp-zh-native"; }\n` +
 		`# A standalone binary embeds the bytecode, so it starts ~4x faster than\n` +
-		`# handing the 30MB bundle to bun. Only usable when it actually runs.\n` +
-		`# not_patched() guards the stale-binary case: an upgrade rewrites cli.js but\n` +
-		`# the old binary would still carry the previous version's UI.\n` +
-		`native_ok() { [ -x "$1" ] && "$1" --version >/dev/null 2>&1; }\n` +
+		`# handing the 30MB bundle to bun.\n` +
+		`#\n` +
+		`# Validity is checked by file shape, never by running it: actually invoking\n` +
+		`# the binary to probe it costs ~0.19s, which would be paid on every single\n` +
+		`# launch and eat most of the 0.35s→0.13s saving. A truncated or wrongly\n` +
+		`# compiled file is caught by its ELF/PE magic plus the size floor instead.\n` +
+		`native_ok() {\n` +
+		`\t[ -f "$1" ] || return 1\n` +
+		`\t[ -s "$1" ] || return 1\n` +
+		`\t# Bytecode binaries are ~190MB; anything tiny is a stub or a failed build.\n` +
+		`\t[ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000000 ] || return 1\n` +
+		`\t# ELF (\\177ELF) or PE (MZ) header, read as two leading bytes.\n` +
+		`\t[ "$(dd if="$1" bs=1 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\n')" = "7f45" ] && return 0\n` +
+		`\t[ "$(dd if="$1" bs=1 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\n')" = "4d5a" ] && return 0\n` +
+		`\treturn 1\n` +
+		`}\n` +
+		`# Freshness guards the upgrade case: rewriting cli.js makes an older binary\n` +
+		`# stale, and running it would show the previous release's UI.\n` +
 		`native_fresh() {\n` +
 		`\tN=$(sidecar_native "$1")\n` +
 		`\tJ=$(sidecar_js "$1")\n` +
@@ -319,7 +357,7 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`if [ -n "$NATIVE" ]; then exec "$NATIVE" "$@"; fi\n` +
 		`exec "$BUN" "$CLI" "$@"\n`;
 	await Bun.write(launcher, body);
-	await fs.chmod(launcher, 0o755);
+	await makeExecutable(launcher);
 	return launcher;
 };
 
@@ -336,15 +374,58 @@ const writeLauncher = async (cli: string): Promise<string> => {
  * Never overwrites an existing file: a real `omp-zh` from another tool wins,
  * and the user is told where the launcher actually is.
  */
-const USER_BIN_DIRS = [
-	path.join(os.homedir(), ".local", "bin"),
-	path.join(os.homedir(), "bin"),
-];
+const USER_BIN_DIRS = IS_WINDOWS
+	? [
+		// %APPDATA%\npm is what npm puts on the user PATH on Windows, and it is
+		// where a `omp-zh.cmd` shim is actually found. Symlinking does not work
+		// there: creating links needs admin rights or Developer Mode, and .cmd
+		// resolution goes through PATHEXT rather than the executable bit.
+		path.join(process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"), "npm"),
+		path.join(os.homedir(), ".omp-zh", "bin"),
+	]
+	: [
+		path.join(os.homedir(), ".local", "bin"),
+		path.join(os.homedir(), "bin"),
+	];
 
-const linkLauncherIntoPath = async (launcher: string): Promise<string[]> => {
+/**
+ * Command shim for Windows, written as `.cmd` rather than `.ps1` because it
+ * works from CMD, PowerShell and Git Bash alike, while a PowerShell script is
+ * refused by the default execution policy.
+ *
+ * It prefers `sh` when present (Git Bash / WSL), which keeps the full
+ * version-walking launcher — including the "official omp moved ahead, re-run
+ * apply" self-heal. Without `sh` it runs the bundle through bun directly, which
+ * is what a native PowerShell user needs. That fallback pins the sidecar chosen
+ * at apply time; native Windows cannot yet walk versions the way the sh
+ * launcher does, so an upgrade may need a fresh `apply`.
+ *
+ * Note the two path styles: the `sh` line must stay POSIX (forward slashes),
+ * because Git Bash passes the argument through to a real shell and a
+ * back-slash path is read as an escape there. The bun line needs native
+ * separators. A single style cannot serve both.
+ */
+const windowsShim = (launcher: string, cli: string, bun: string): string =>
+	`@echo off\r\n` +
+	`rem Generated by omp-zh. Prefers the sh launcher (Git Bash / WSL),\r\n` +
+	`rem falls back to running the patched bundle with bun directly.\r\n` +
+	`where sh >nul 2>nul\r\n` +
+	`if %ERRORLEVEL% EQU 0 (\r\n` +
+	`\tsh "${toPosixPath(launcher)}" %*\r\n` +
+	`\texit /b %ERRORLEVEL%\r\n` +
+	`)\r\n` +
+	`"${toWinPath(bun)}" "${toWinPath(cli)}" %*\r\n`;
+
+/** Windows-native separators, for arguments CMD/PowerShell consume. */
+const toWinPath = (p: string): string => p.replace(/\//g, "\\");
+
+/** POSIX separators, for arguments Git Bash / WSL consume. */
+const toPosixPath = (p: string): string => p.replace(/\\/g, "/");
+
+const linkLauncherIntoPath = async (launcher: string, cli: string): Promise<string[]> => {
 	const linked: string[] = [];
 	for (const dir of USER_BIN_DIRS) {
-		const dest = path.join(dir, "omp-zh");
+		const dest = path.join(dir, IS_WINDOWS ? "omp-zh.cmd" : "omp-zh");
 		try {
 			await fs.mkdir(dir, { recursive: true });
 			// A symlink to this very launcher is already correct; anything else
@@ -357,11 +438,78 @@ const linkLauncherIntoPath = async (launcher: string): Promise<string[]> => {
 				}
 				continue;
 			}
+			if (IS_WINDOWS) {
+				await Bun.write(dest, windowsShim(launcher, cli, BUN_PATH));
+				linked.push(dest);
+				continue;
+			}
 			await fs.symlink(launcher, dest);
 			linked.push(dest);
 		} catch { /* read-only or unwritable: the PATH hint below still helps */ }
 	}
 	return linked;
+};
+
+/**
+ * Follow a Windows/npm wrapper script to the JS bundle it actually runs.
+ *
+ * The shim is a two-line batch or PowerShell file whose text embeds the entry
+ * path (`...\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js`). Parsing that
+ * text is more reliable than guessing a global root, because npm, bun, pnpm and
+ * nvm each place the package somewhere different. Returns undefined when no
+ * `dist/cli.js`-shaped path can be recovered, in which case callers fall back
+ * to the conventional global locations.
+ */
+const cliFromShim = async (shim: string): Promise<string | undefined> => {
+	const REL = ["@oh-my-pi", "pi-coding-agent", "dist", "cli.js"];
+	// Both npm and bun place the wrapper beside the tree it execs:
+	//   <prefix>\omp.cmd  +  <prefix>\node_modules\@oh-my-pi\...
+	// This probe alone covers both, without depending on how the shim spells
+	// its path. Windows wrappers also `cd` nowhere, so the sibling layout is
+	// what the shim's own `%~dp0` resolves to anyway.
+	const sibling = path.join(path.dirname(shim), "node_modules", ...REL);
+	if (existsSync(sibling)) return sibling;
+	try {
+		const text = await Bun.file(shim).text();
+		// Batch uses backslashes; PowerShell uses both. Normalise, then strip
+		// variable references (`%dp0%`, `$PSScriptRoot`) so only literal text
+		// remains to match against.
+		const normalised = text
+			.replace(/\\/g, "/")
+			.replace(/%~?dp0%|\$PSScriptRoot|\$\{PSScriptRoot\}/gi, "")
+			.replace(/%[^%\r\n]+%|\$[A-Za-z_][A-Za-z0-9_]*/g, "");
+		const marker = "@oh-my-pi/pi-coding-agent/dist/cli.js";
+		const pattern = new RegExp(`[^\\s"'\`;|()<>]*${marker.replace(/[/.]/g, "\\$&")}`, "g");
+		for (const m of normalised.matchAll(pattern)) {
+			const at = m[0].indexOf("@oh-my-pi/");
+			const prefix = m[0].slice(0, at);
+			// An absolute prefix (drive letter or POSIX root) is used verbatim;
+			// anything else is relative to the shim.
+			const isAbs = /^([A-Za-z]:[\\/]|[\\/])/.test(prefix);
+			const base = isAbs ? path.normalize(prefix) : path.join(path.dirname(shim), prefix);
+			const candidate = path.join(base, ...REL);
+			if (existsSync(candidate)) return candidate;
+		}
+	} catch { /* unreadable shim: the caller falls back to conventional roots */ }
+	return undefined;
+};
+
+/** Candidate global package roots to probe when no shim reveals the path. */
+const globalPackageRoots = (): string[] => {
+	const roots: string[] = [];
+	const pm = path.join(os.homedir(), ".bun", "install", "global", "node_modules");
+	roots.push(path.join(pm, "@oh-my-pi", "pi-coding-agent", "dist", "cli.js"));
+	if (IS_WINDOWS) {
+		const appData = process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
+		const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
+		// npm global prefix on Windows is %APPDATA%\npm; nvm-windows and pnpm
+		// keep their own trees, so probe the common ones rather than guessing.
+		roots.push(path.join(appData, "npm", "node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli.js"));
+		roots.push(path.join(localAppData, "pnpm", "global", "5", "node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli.js"));
+		const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+		roots.push(path.join(programFiles, "nodejs", "node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli.js"));
+	}
+	return roots;
 };
 
 /** True when `dir` is already exported by the current PATH. */
@@ -376,6 +524,16 @@ const dirOnPath = (dir: string): boolean =>
 const resolveTarget = async (): Promise<OmpTarget> => {
 	const envPkg = process.env.OMP_PKG;
 	if (envPkg) {
+		if (isShellShim(envPkg)) {
+			// Users on Windows reach for `OMP_PKG=...\omp.cmd` because that is
+			// the path they see on PATH; resolve through it the same way.
+			const fromShim = await cliFromShim(envPkg);
+			if (fromShim) return { cliPath: fromShim, kind: "installed", version: await bundleVersion(fromShim) };
+			throw new Error(
+				`OMP_PKG points at a shell shim (${envPkg}) and the bundle path could not be read from it.\n` +
+				`  Point OMP_PKG at the package directory instead, e.g. OMP_PKG=<...>/node_modules/@oh-my-pi/pi-coding-agent`,
+			);
+		}
 		const cli = envPkg.endsWith(".js") ? envPkg : path.join(envPkg, "dist", "cli.js");
 		return { cliPath: cli, kind: "installed", version: await bundleVersion(cli) };
 	}
@@ -384,10 +542,22 @@ const resolveTarget = async (): Promise<OmpTarget> => {
 	if (fromPath) {
 		try { candidates.push(realpathSync(fromPath)); } catch { candidates.push(fromPath); }
 	}
-	candidates.push(path.join(os.homedir(), ".bun", "install", "global", "node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli.js"));
+	candidates.push(...globalPackageRoots());
 
 	for (const candidate of candidates) {
 		if (!existsSync(candidate)) continue;
+		// A Windows/npm wrapper is not a bundle: resolve through it to the real
+		// cli.js before anything tries to parse or back it up.
+		if (isShellShim(candidate)) {
+			const cli = await cliFromShim(candidate);
+			if (cli) {
+				return { cliPath: cli, kind: "installed", version: await bundleVersion(cli) };
+			}
+			// No recoverable path: keep looking rather than handing a .cmd file
+			// to Babel (which fails with a syntax error that names the wrong
+			// problem) or to the backup mkdir (which fails with ENOTDIR).
+			continue;
+		}
 		const bytes = new Uint8Array(await Bun.file(candidate).arrayBuffer());
 		if (isNativeBinary(bytes)) {
 			if (process.env.OMP_ZH_NO_SIDECAR === "1") {
@@ -397,13 +567,16 @@ const resolveTarget = async (): Promise<OmpTarget> => {
 			if (!version) throw new Error(`cannot determine omp version from ${candidate}`);
 			const cli = await materializeSidecar(version);
 			const launcher = await writeLauncher(cli);
-			const linked = await linkLauncherIntoPath(launcher);
+			const linked = await linkLauncherIntoPath(launcher, cli);
 			// Diagnostics go to stderr: `patch.ts path` prints the resolved
 			// bundle path on stdout and callers capture that verbatim.
 			console.error(`已生成启动器：${launcher}`);
 			if (linked.length > 0) {
 				console.error(`已链接到 PATH 中的目录：${linked.join("、")}`);
 				console.error(`直接运行 \`omp-zh\` 即为中文界面（新开终端生效）。`);
+			} else if (IS_WINDOWS) {
+				console.error(`未能写入 %APPDATA%\\npm，请把该目录加入 PATH，或直接运行：`);
+				console.error(`  bun "${cli}"`);
 			} else {
 				console.error(`未能自动加入 PATH，请手动执行：export PATH="${LAUNCHER_DIR}:$PATH"`);
 			}
@@ -414,9 +587,27 @@ const resolveTarget = async (): Promise<OmpTarget> => {
 	return { cliPath: candidates[candidates.length - 1], kind: "installed" };
 };
 
-const TARGET = await resolveTarget();
+/**
+ * Resolved at module scope because nearly every command needs it, but a
+ * *failure* here must not take `doctor` down with it: diagnosing a broken or
+ * unsupported install is exactly when resolution fails, and a stack trace tells
+ * the user nothing. Fall back to a best-effort path and let `doctor` report.
+ */
+const TARGET: OmpTarget = await resolveTarget().catch((e: unknown) => {
+	const envPkg = process.env.OMP_PKG;
+	// Never concatenate onto a shim: `omp.cmd/dist/cli.js` is not a path anyone
+	// can act on. Report the conventional location instead and let `doctor`
+	// explain the real problem.
+	const fallback = envPkg && !isShellShim(envPkg)
+		? (envPkg.endsWith(".js") ? envPkg : path.join(envPkg, "dist", "cli.js"))
+		: globalPackageRoots()[0];
+	console.error(`警告：无法确定 omp 目标（${e instanceof Error ? e.message : String(e)}）`);
+	console.error(`      已回退到 ${fallback}，请运行 \`bun patch.ts doctor\` 查看完整诊断。`);
+	return { cliPath: fallback, kind: "installed" as const };
+});
 const CLI_PATH = TARGET.cliPath;
 const PKG = packageRoot(CLI_PATH);
+
 
 /**
  * Read the bundle and fail with an actionable message when the target is not
@@ -2020,7 +2211,7 @@ const apply = async (): Promise<void> => {
 	const installedMode = (await fs.stat(CLI_PATH)).mode & 0o777;
 	const tmpPath = CLI_PATH + ".tmp-patch";
 	await Bun.write(tmpPath, out);
-	await fs.chmod(tmpPath, installedMode || 0o755);
+	await makeExecutable(tmpPath, installedMode || 0o755);
 	await fs.rename(tmpPath, CLI_PATH);
 
 	const manifest = {
@@ -2224,7 +2415,7 @@ const restore = async (): Promise<void> => {
 	const data = await Bun.file(newest).text();
 	const mode = (await fs.stat(CLI_PATH).mode & 0o777) || 0o755;
 	await Bun.write(CLI_PATH, data);
-	await fs.chmod(CLI_PATH, mode);
+	await makeExecutable(CLI_PATH, mode);
 	console.log(`restored ${(data.length / 1e6).toFixed(2)}MB from ${newest}`);
 
 	// The precompiled binary embeds the patched bundle, so leaving it behind
@@ -2460,6 +2651,19 @@ const check = async (codePath?: string, jsonPath?: string): Promise<void> => {
 const doctor = async (): Promise<void> => {
 	console.log(`platform: ${process.platform} ${process.arch}`);
 	console.log(`bun: ${Bun.version}`);
+	// Windows support is unverified: report the environment that actually
+	// decides whether the sh launcher, the .cmd shim or neither can run. A
+	// doctor paste is the fastest way to turn these guesses into facts, so the
+	// output stays copy-pasteable on purpose.
+	if (IS_WINDOWS) {
+		console.log(`env HOME/USERPROFILE: ${process.env.HOME ?? "(unset)"} / ${process.env.USERPROFILE ?? "(unset)"}`);
+		console.log(`env APPDATA/LOCALAPPDATA: ${process.env.APPDATA ?? "(unset)"} / ${process.env.LOCALAPPDATA ?? "(unset)"}`);
+		console.log(`PATHEXT: ${process.env.PATHEXT ?? "(unset)"}`);
+		const sh = Bun.which("sh");
+		console.log(`which sh: ${sh ?? "(not on PATH)"}${sh ? "  <-- Git Bash / WSL present, full launcher usable" : "  <-- native shell only, .cmd shim runs bun directly"}`);
+	} else {
+		console.log(`SHELL: ${process.env.SHELL ?? "(unset)"}`);
+	}
 	console.log(`install kind: ${TARGET.kind}${TARGET.version ? ` (omp ${TARGET.version})` : ""}`);
 	if (TARGET.launcher) console.log(`launcher: ${TARGET.launcher}`);
 	console.log(`CLI path: ${CLI_PATH}`);
@@ -2469,7 +2673,15 @@ const doctor = async (): Promise<void> => {
 		const fromPath = Bun.which("omp");
 		console.log(`which omp: ${fromPath ?? "(not on PATH)"}`);
 		if (fromPath) {
+			// On Windows this is normally a .cmd/.ps1 wrapper, not the bundle.
+			// Print what it is and where it points, because "the patcher picked
+			// up omp.cmd" is the single most likely cause of a Windows failure.
+			console.log(`  looks like shell shim: ${isShellShim(fromPath)}`);
 			try { console.log(`  realpath: ${realpathSync(fromPath)}`); } catch { /* ignore */ }
+			if (isShellShim(fromPath)) {
+				const resolved = await cliFromShim(fromPath);
+				console.log(`  resolved bundle from shim: ${resolved ?? "(could not parse — report this)"}`);
+			}
 		}
 	} catch { /* ignore */ }
 	console.log(`package: ${PKG}`);
@@ -2478,6 +2690,15 @@ const doctor = async (): Promise<void> => {
 		console.log(`  version: ${pkg.version ?? "?"}`);
 	} catch {
 		console.log("  package.json: unreadable");
+	}
+	if (!existsSync(CLI_PATH)) {
+		// Everything below reads the bundle; without it the report would be a
+		// stack trace instead of the diagnostics the user came for.
+		console.log(`bundle: MISSING at ${CLI_PATH}`);
+		console.log(`  hint: install omp first (npm i -g @oh-my-pi/pi-coding-agent), or set OMP_PKG to the package dir`);
+		const backups0 = await listBackupEntries();
+		console.log(`backups (${backups0.length})`);
+		return;
 	}
 	const bytes = new Uint8Array(await Bun.file(CLI_PATH).arrayBuffer());
 	console.log(`bundle: ${(bytes.length / 1e6).toFixed(2)}MB`);

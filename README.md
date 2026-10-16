@@ -34,6 +34,64 @@ bin/、runtime/ 为本地生成物（启动器与侧载运行时），不入库
 | Homebrew | 通常指向 npm 包，同第一种 |
 | 源码构建 | 直接改写构建产物 |
 
+## Windows 支持现状
+
+**原生 Windows（PowerShell / CMD）尚未验证。** 下面是代码层面的现状，真机结论需要用户跑
+`bun patch.ts doctor` 后反馈（见「诊断」一节）。
+
+| 环境 | 状态 |
+|---|---|
+| WSL / Git Bash | 与 Linux 相同路径，`install.sh`、`omp-zh.sh` 可直接用 |
+| 原生 PowerShell / CMD | `patch.ts` 已能跑，`install.sh` / `omp-zh.sh` 这两个 bash 入口用不了 |
+| 官方预编译二进制 | **上游不提供 Windows 版本**：`omp.sh/install` 只认 Linux/macOS，遇到其它系统直接 `Unsupported OS` |
+
+也就是说 Windows 上装 omp 只能走 npm/bun 全局包：
+
+```powershell
+npm install -g @oh-my-pi/pi-coding-agent
+# 或
+bun add -g @oh-my-pi/pi-coding-agent
+```
+
+这个形态下产物是 `dist/cli.js`，npm 会在旁边放一个 `omp.cmd` / `omp.ps1` 包装脚本。
+补丁器已经处理了这个坑：`Bun.which("omp")` 在 Windows 上拿到的是**包装脚本而不是 JS**，
+直接当作目标会让 Babel 去解析批处理语法、让备份的 `mkdir` 报 `ENOTDIR`。现在会把包装
+脚本里的路径解析出来，定位真正的 `dist/cli.js`（支持 npm 的 `%~dp0` 形态、bun 的绝对路径
+形态和 PowerShell 的 `$PSScriptRoot` 形态）。
+
+应用汉化（PowerShell，`bun` 需先安装）：
+
+```powershell
+git clone https://github.com/yebuwudong/omp-zh.git $env:USERPROFILE\.omp-zh
+cd $env:USERPROFILE\.omp-zh
+bun install
+bun patch.ts apply      # 打补丁 + 校验
+bun patch.ts verify     # 只校验
+bun patch.ts restore    # 还原英文
+```
+
+原地安装（上面这种）**不需要启动器**：改的就是 `omp` 自己要跑的 `dist/cli.js`，
+敲 `omp` 即为中文。侧载启动器和 `.cmd` 只在预编译二进制安装下才需要，而 Windows 没有官方
+二进制，所以这条路径基本用不上。
+
+已知限制：
+
+- 未在真机验证。所有 Windows 分支都是按代码和模拟环境写的，需要实测确认。
+- Windows 上不做 `chmod` / symlink（前者无意义，后者需要管理员权限或开发者模式）。
+- 未做 `.cmd` 启动器的自动 PATH 集成测试。
+
+## 诊断
+
+装不上、报错、或者行为不符合预期时，先跑一次 `doctor` —— 它会在任何平台上输出环境信息、
+解析到的目标路径、产物形态和备份清单，且**目标解析失败时也不会崩**（这正是最需要诊断的时候）：
+
+```bash
+bun patch.ts doctor
+```
+
+Windows 上会额外输出 `USERPROFILE`、`APPDATA`、`PATHEXT`、是否找到 `sh`，以及包装脚本
+解析出的真实 bundle 路径。提 issue 时把整段贴上来即可。
+
 侧载目录 `~/.omp-zh/runtime/<版本>/`，启动器 `~/.omp-zh/bin/omp-zh`。补丁器会按 `omp --version` 自动选择路径，无需手工配置。
 
 **二进制安装请用 `omp-zh` 启动**（官方 `omp` 保持原样，仍是英文——这是设计如此，不是补丁失败）。
@@ -58,7 +116,7 @@ bin/、runtime/ 为本地生成物（启动器与侧载运行时），不入库
 
 | 启动路径 | 耗时 |
 |---|---|
-| 字节码二进制（默认） | **约 0.35 秒** |
+| 字节码二进制（默认） | **约 0.2 秒** |
 | bun 读取 JS 产物（回退） | 约 1.1 秒 |
 | 官方 omp（原生，无汉化） | 约 0.13 秒 |
 
@@ -297,6 +355,27 @@ if (k === __omp_i18n_t("__proto__") || ...) continue;  // 恒为 false，防护�
 
 ## 更新日志
 
+### 预编译字节码二进制 + Windows 兼容性
+
+**启动性能**：侧载运行时是 30MB JS 产物，每次启动重新解析编译要 1.1 秒。`apply` 现在会额外
+把它预编译成带字节码的独立二进制，启动器优先使用，**实测从 1.1 秒降到 0.2 秒**。细节见
+上面「启动性能」一节，包括 `--format=esm` 为什么是必需的。
+
+**Windows 兼容性**（未真机验证）：
+
+1. **包装脚本不再被当成目标**。Windows 的 npm/bun 会在 PATH 上放 `omp.cmd` / `omp.ps1`，
+   `Bun.which("omp")` 拿到的就是它。此前直接当作 bundle 会让 Babel 解析批处理语法、
+   让备份的 `mkdir` 报 `ENOTDIR`。现在会从包装脚本里解析出真正的 `dist/cli.js`，支持
+   npm 的 `%~dp0` 相对形态、bun 的绝对路径形态和 PowerShell 的 `$PSScriptRoot` 形态。
+2. **目标解析失败不再拖垮 `doctor`**。以前 `resolveTarget()` 在模块加载期执行且没有兜底，
+   Windows 上跑任何命令（包括 `doctor`）都是先崩再谈诊断 —— 恰恰在最需要诊断的时候拿不到
+   信息。现在解析失败会回退并提示跑 `doctor`，`doctor` 本身也补上了 bundle 缺失的分支。
+3. **`chmod` 与 symlink 平台化**。Windows 上跳过 `chmod`（无意义）与 symlink（需要管理员
+   权限或开发者模式），改为在 `%APPDATA%\npm` 生成 `.cmd` 启动器；`.cmd` 里 `sh` 分支用
+   POSIX 正斜杠路径（Git Bash 会把它交给真 shell，反斜杠会被当转义），bun 分支用原生反斜杠。
+4. **`doctor` 增加 Windows 诊断项**：`USERPROFILE`、`APPDATA`、`PATHEXT`、是否找到 `sh`、
+   包装脚本解析结果。
+
 ### 适配 omp 18.10.x：启动器版本漂移、欢迎页提示、设置页脚、词典缺口
 
 面向 omp **18.10.1** 的一轮修复，四类问题都表现为「界面仍是英文」：
@@ -418,6 +497,7 @@ CI 门禁同步收紧：模板目标失配从「软警告（exit 2）」升为�
 
 - 极少数词典未收录的条目仍为英文（如 `Agent Reactions`、`Mouse Click-to-Focus`）。
 - 翻译来自社区分支 `yequ172672/oh-my-pi-cn`，个别术语可能与上游新增功能不完全对齐。
+- **Windows 原生环境未在真机验证**（见「Windows 支持现状」）；`install.sh` / `omp-zh.sh` 是 bash 脚本，Windows 上需手动执行 `bun patch.ts` 子命令。
 - 已实测：`--version`、欢迎屏、设置面板（含页脚与右列值）、slash 补全描述、`OMP_ZH=0` 回退、TUI 冒烟零残留。
 
 ## 设置行右列的值显示

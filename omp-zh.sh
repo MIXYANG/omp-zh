@@ -117,7 +117,7 @@ status)
 		VER_DIR="$(dirname "$(dirname "$(dirname "$(dirname "$(dirname "$CLI")")")")")"
 		NATIVE="$VER_DIR/omp-zh-native"
 		if [[ -x "$NATIVE" && "$NATIVE" -nt "$CLI" ]]; then
-			echo "启动性能:      字节码二进制（约 0.35 秒）"
+			echo "启动性能:      字节码二进制（约 0.2 秒）"
 		elif [[ -x "$NATIVE" ]]; then
 			echo "启动性能:      二进制已过期，正在回退 JS 路径（约 1.1 秒）"
 			echo "               重跑 apply 可重建：./omp-zh.sh apply"
