@@ -1,6 +1,7 @@
 # omp 中文界面汉化
 
 [![LINUX DO](https://img.shields.io/badge/社区-LINUX%20DO-blue)](https://linux.do)
+[![License: MIT](https://img.shields.io/badge/许可-MIT-green)](./LICENSE)
 
 把已安装的官方 omp 界面汉化为简体中文，**不改变版本、不替换安装、不动运行时结构**。
 补丁器跟随上游持续适配，不绑定具体版本号——上游发新版后重跑一条命令即可。
@@ -546,5 +547,7 @@ OMP_ZH=0 bun tools/test-value-labels.ts   # 回退断言（全英文）
 
 ## 来源与许可
 
-译文取自 [yequ172672/oh-my-pi-cn](https://github.com/yequ172672/oh-my-pi-cn)（MIT，与上游
-[can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) 同许可）。本地仅做版本适配与安全裁剪，未改动译文语义。
+本项目以 [MIT](./LICENSE) 发布。译文取自
+[yequ172672/oh-my-pi-cn](https://github.com/yequ172672/oh-my-pi-cn)（MIT，与上游
+[can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) 同许可），本地仅做版本适配与安全裁剪，
+未改动译文语义。`LICENSE` 里保留了上游与译文来源的原始版权声明，再分发时请一并保留。

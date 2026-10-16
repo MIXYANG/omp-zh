@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "omp 终端界面简体中文汉化补丁器",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@babel/parser": "^7.29.8"
