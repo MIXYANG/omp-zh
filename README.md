@@ -36,16 +36,42 @@ bin/、runtime/ 为本地生成物（启动器与侧载运行时），不入库
 
 ## Windows 支持现状
 
-**原生 Windows（PowerShell / CMD）尚未验证。** 下面是代码层面的现状，真机结论需要用户跑
+**原生 Windows（PowerShell / CMD）尚未经真机验证。** 下面是代码层面的现状，真机结论需要用户跑
 `bun patch.ts doctor` 后反馈（见「诊断」一节）。
 
 | 环境 | 状态 |
 |---|---|
 | WSL / Git Bash | 与 Linux 相同路径，`install.sh`、`omp-zh.sh` 可直接用 |
 | 原生 PowerShell / CMD | `patch.ts` 已能跑，`install.sh` / `omp-zh.sh` 这两个 bash 入口用不了 |
-| 官方预编译二进制 | **上游不提供 Windows 版本**：`omp.sh/install` 只认 Linux/macOS，遇到其它系统直接 `Unsupported OS` |
+| 官方预编译 `.exe` | 上游提供 `omp-windows-x64.exe` / `omp-windows-arm64.exe`，并有配套的 `install.ps1` |
 
-也就是说 Windows 上装 omp 只能走 npm/bun 全局包：
+## Windows 的两种安装方式
+
+### 方式一：官方预编译二进制（推荐）
+
+上游为 Windows 提供了独立的 PowerShell 安装器，装到 `%LOCALAPPDATA%\omp\omp.exe`：
+
+```powershell
+irm https://omp.sh/install.ps1 | iex
+```
+
+二进制内嵌字节码，**不能就地改写**，所以汉化走侧载：补丁器取同版本 JS 包到
+`~/.omp-zh/runtime/<版本>/`，改那一份，并生成 `%APPDATA%\npm\omp-zh.cmd` 启动器。
+官方 `omp.exe` 保持原样（仍是英文，这是设计如此）。
+
+```powershell
+git clone https://github.com/yebuwudong/omp-zh.git $env:USERPROFILE\.omp-zh
+cd $env:USERPROFILE\.omp-zh
+bun install
+bun patch.ts apply      # 打补丁 + 生成启动器 + 校验
+omp-zh                  # 中文界面
+bun patch.ts restore    # 还原
+```
+
+`.cmd` 启动器里优先走 `sh`（Git Bash / WSL 存在时），这样能沿用完整的版本自愈逻辑；
+没有 `sh` 时直接用 bun 跑侧载产物。
+
+### 方式二：npm / bun 全局包（就地汉化）
 
 ```powershell
 npm install -g @oh-my-pi/pi-coding-agent
@@ -59,26 +85,19 @@ bun add -g @oh-my-pi/pi-coding-agent
 脚本里的路径解析出来，定位真正的 `dist/cli.js`（支持 npm 的 `%~dp0` 形态、bun 的绝对路径
 形态和 PowerShell 的 `$PSScriptRoot` 形态）。
 
-应用汉化（PowerShell，`bun` 需先安装）：
+这种安装**不需要启动器**：改的就是 `omp` 自己要跑的 `dist/cli.js`，敲 `omp` 即为中文。
 
-```powershell
-git clone https://github.com/yebuwudong/omp-zh.git $env:USERPROFILE\.omp-zh
-cd $env:USERPROFILE\.omp-zh
-bun install
-bun patch.ts apply      # 打补丁 + 校验
-bun patch.ts verify     # 只校验
-bun patch.ts restore    # 还原英文
 ```
-
-原地安装（上面这种）**不需要启动器**：改的就是 `omp` 自己要跑的 `dist/cli.js`，
-敲 `omp` 即为中文。侧载启动器和 `.cmd` 只在预编译二进制安装下才需要，而 Windows 没有官方
-二进制，所以这条路径基本用不上。
+bun patch.ts apply / verify / restore
+```
 
 已知限制：
 
 - 未在真机验证。所有 Windows 分支都是按代码和模拟环境写的，需要实测确认。
-- Windows 上不做 `chmod` / symlink（前者无意义，后者需要管理员权限或开发者模式）。
-- 未做 `.cmd` 启动器的自动 PATH 集成测试。
+- Windows 上不做 `chmod` / symlink（前者无意义，后者需要管理员权限或开发者模式），
+  启动器改为 `.cmd` 文件。
+- 完整对等的 PowerShell 版 `install.ps1` / `omp-zh.ps1`（自动 clone、更新、一键 apply 等）
+  尚未提供，目前需要手动跑 `bun patch.ts` 子命令。
 
 ## 诊断
 
@@ -375,6 +394,9 @@ if (k === __omp_i18n_t("__proto__") || ...) continue;  // 恒为 false，防护�
    POSIX 正斜杠路径（Git Bash 会把它交给真 shell，反斜杠会被当转义），bun 分支用原生反斜杠。
 4. **`doctor` 增加 Windows 诊断项**：`USERPROFILE`、`APPDATA`、`PATHEXT`、是否找到 `sh`、
    包装脚本解析结果。
+5. **`OMP_PKG` 指向 `.exe` 时走侧载**。官方 Windows 安装器装的是
+   `%LOCALAPPDATA%\omp\omp.exe`，把它当包目录会拼出 `omp.exe\dist\cli.js` 这种无效
+   路径。现在识别出这是预编译二进制，改走侧载并生成启动器。
 
 ### 适配 omp 18.10.x：启动器版本漂移、欢迎页提示、设置页脚、词典缺口
 

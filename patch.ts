@@ -77,6 +77,16 @@ const isNativeBinary = (bytes: Uint8Array): boolean => {
 	return false;
 };
 
+/** Read a file's header and decide whether it is a prebuilt binary. */
+const looksLikeNativeBinary = async (p: string): Promise<boolean> => {
+	try {
+		const probe = new Uint8Array(await Bun.file(p).slice(0, 4).arrayBuffer());
+		return isNativeBinary(probe);
+	} catch {
+		return false;
+	}
+};
+
 const SIDECAR_ROOT = path.join(os.homedir(), ".omp-zh", "runtime");
 const LAUNCHER_DIR = path.join(os.homedir(), ".omp-zh", "bin");
 
@@ -534,6 +544,34 @@ const resolveTarget = async (): Promise<OmpTarget> => {
 				`  Point OMP_PKG at the package directory instead, e.g. OMP_PKG=<...>/node_modules/@oh-my-pi/pi-coding-agent`,
 			);
 		}
+		// A prebuilt binary (the official Windows installer drops omp.exe into
+		// %LOCALAPPDATA%\omp) cannot be patched in place, so it must take the
+		// sidecar route — treating it as a package dir would produce the
+		// meaningless `<...>\omp.exe\dist\cli.js`.
+		if (await looksLikeNativeBinary(envPkg)) {
+			if (process.env.OMP_ZH_NO_SIDECAR === "1") {
+				throw new Error(`OMP_PKG points at a native binary (${envPkg}); set it to a JS package instead`);
+			}
+			const version = probeVersion(envPkg) ?? await bundleVersion(envPkg);
+			if (!version) {
+				throw new Error(
+					`cannot determine the omp version from ${envPkg}\n` +
+					`  run \`${envPkg} --version\` and re-run with OMP_PKG pointing at the JS package`,
+				);
+			}
+			const cli = await materializeSidecar(version);
+			const launcher = await writeLauncher(cli);
+			const linked = await linkLauncherIntoPath(launcher, cli);
+			console.error(`已生成启动器：${launcher}`);
+			if (linked.length > 0) {
+				console.error(`已链接到 PATH 中的目录：${linked.join("、")}`);
+			} else if (IS_WINDOWS) {
+				console.error(`未能写入 %APPDATA%\\npm，请把该目录加入 PATH，或直接运行：bun "${cli}"`);
+			} else {
+				console.error(`未能自动加入 PATH，请手动执行：export PATH="${LAUNCHER_DIR}:$PATH"`);
+			}
+			return { cliPath: cli, kind: "sidecar", version, launcher };
+		}
 		const cli = envPkg.endsWith(".js") ? envPkg : path.join(envPkg, "dist", "cli.js");
 		return { cliPath: cli, kind: "installed", version: await bundleVersion(cli) };
 	}
@@ -595,11 +633,13 @@ const resolveTarget = async (): Promise<OmpTarget> => {
  */
 const TARGET: OmpTarget = await resolveTarget().catch((e: unknown) => {
 	const envPkg = process.env.OMP_PKG;
-	// Never concatenate onto a shim: `omp.cmd/dist/cli.js` is not a path anyone
-	// can act on. Report the conventional location instead and let `doctor`
-	// explain the real problem.
-	const fallback = envPkg && !isShellShim(envPkg)
-		? (envPkg.endsWith(".js") ? envPkg : path.join(envPkg, "dist", "cli.js"))
+	// Never concatenate onto something that is not a package directory:
+	// `omp.cmd/dist/cli.js` and `omp.exe/dist/cli.js` are not paths anyone can
+	// act on. Report the conventional location instead and let `doctor` explain
+	// the real problem.
+	const usable = envPkg !== undefined && !isShellShim(envPkg) && !envPkg.match(/\.exe$/i);
+	const fallback = usable
+		? (envPkg!.endsWith(".js") ? envPkg! : path.join(envPkg!, "dist", "cli.js"))
 		: globalPackageRoots()[0];
 	console.error(`警告：无法确定 omp 目标（${e instanceof Error ? e.message : String(e)}）`);
 	console.error(`      已回退到 ${fallback}，请运行 \`bun patch.ts doctor\` 查看完整诊断。`);
