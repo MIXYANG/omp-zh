@@ -111,6 +111,20 @@ status)
 	# report the launcher state rather than leaving the user to guess.
 	if [[ "$CLI" == *"/.omp-zh/runtime/"* ]]; then
 		echo "启动方式:      omp-zh（预编译二进制安装；官方 omp 始终为英文）"
+		# Whether omp-zh starts fast depends on the precompiled bytecode binary
+		# being present AND newer than the bundle it was built from: an upgrade
+		# rewrites cli.js and would otherwise leave the old UI shadowing it.
+		VER_DIR="$(dirname "$(dirname "$(dirname "$(dirname "$(dirname "$CLI")")")")")"
+		NATIVE="$VER_DIR/omp-zh-native"
+		if [[ -x "$NATIVE" && "$NATIVE" -nt "$CLI" ]]; then
+			echo "启动性能:      字节码二进制（约 0.35 秒）"
+		elif [[ -x "$NATIVE" ]]; then
+			echo "启动性能:      二进制已过期，正在回退 JS 路径（约 1.1 秒）"
+			echo "               重跑 apply 可重建：./omp-zh.sh apply"
+		else
+			echo "启动性能:      JS 路径（约 1.1 秒）"
+			echo "               生成字节码二进制可提速约 3 倍：bun patch.ts native"
+		fi
 		if command -v omp-zh >/dev/null 2>&1; then
 			echo "               omp-zh 已在 PATH 中：$(command -v omp-zh)"
 		else

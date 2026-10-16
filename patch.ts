@@ -163,6 +163,53 @@ const BUN_PATH = ((): string => {
 })();
 
 /**
+ * Standalone precompiled binary for a sidecar version, next to the JS bundle it
+ * was built from.
+ */
+const nativeBinaryPath = (version: string): string =>
+	path.join(SIDECAR_ROOT, version, "omp-zh-native");
+
+/**
+ * Precompile the patched sidecar into a standalone binary that carries Bun's
+ * bytecode cache.
+ *
+ * The sidecar is a ~30 MB JavaScript bundle, so `bun cli.js` re-parses and
+ * re-compiles it on every launch — ~1.2 s measured on this arm64 machine. A
+ * standalone binary built with `--bytecode` embeds the compiled bytecode and
+ * skips that work: ~0.3 s for the same bundle, i.e. 4x faster startup, at the
+ * cost of ~5.5 s of build time and ~190 MB of disk per version.
+ *
+ * `--format=esm` is mandatory, not cosmetic. `--bytecode` defaults to CommonJS,
+ * CJS has no top-level `await`, and the upstream bundle uses it in 162 places;
+ * without the flag Bun aborts with a bare "Failed to generate bytecode" that
+ * names neither the format nor the await.
+ *
+ * Best-effort by design: any failure leaves the JS path working, because a
+ * slower Chinese UI beats no Chinese UI.
+ */
+const compileNative = async (cli: string, version: string): Promise<string | undefined> => {
+	if (process.env.OMP_ZH_NO_NATIVE === "1") return undefined;
+	const out = nativeBinaryPath(version);
+	// cwd must be inside the sidecar so `bun build` resolves the package's own
+	// dependencies (`@oh-my-pi/pi-natives/vcs` and friends); from an unrelated
+	// directory the build dies with "Could not resolve".
+	const cwd = path.dirname(path.dirname(path.dirname(path.dirname(path.dirname(cli)))));
+	console.error(`正在预编译字节码二进制（约 5 秒）：${out} …`);
+	const proc = Bun.spawnSync(
+		["bun", "build", "--compile", "--bytecode", "--format=esm", cli, "--outfile", out],
+		{ cwd, stdout: "ignore", stderr: "pipe" },
+	);
+	if (proc.exitCode !== 0 || !existsSync(out)) {
+		const why = proc.stderr.toString().trim().split("\n").pop() ?? `exit ${proc.exitCode}`;
+		console.error(`预编译失败，继续使用 JS 路径（启动稍慢）：${why}`);
+		return undefined;
+	}
+	await fs.chmod(out, 0o755);
+	console.error(`已生成字节码二进制：${out}`);
+	return out;
+};
+
+/**
  * Write the `omp-zh` launcher that runs the patched sidecar bundle.
  *
  * The launcher must NOT hard-code one versioned sidecar path. A prebuilt omp
@@ -204,6 +251,19 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`done\n` +
 		`\n` +
 		`sidecar_js() { echo "$RUNTIME_ROOT/$1/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"; }\n` +
+		`sidecar_native() { echo "$RUNTIME_ROOT/$1/omp-zh-native"; }\n` +
+		`# A standalone binary embeds the bytecode, so it starts ~4x faster than\n` +
+		`# handing the 30MB bundle to bun. Only usable when it actually runs.\n` +
+		`# not_patched() guards the stale-binary case: an upgrade rewrites cli.js but\n` +
+		`# the old binary would still carry the previous version's UI.\n` +
+		`native_ok() { [ -x "$1" ] && "$1" --version >/dev/null 2>&1; }\n` +
+		`native_fresh() {\n` +
+		`\tN=$(sidecar_native "$1")\n` +
+		`\tJ=$(sidecar_js "$1")\n` +
+		`\tnative_ok "$N" || return 1\n` +
+		`\t[ -f "$J" ] || return 0\n` +
+		`\t[ "$N" -nt "$J" ]\n` +
+		`}\n` +
 		`is_patched() { [ -f "$1" ] && grep -q 'var __omp_i18n_d=' "$1" 2>/dev/null; }\n` +
 		`# 1 when $1 is a newer dotted version than $2.\n` +
 		`newer_than() {\n` +
@@ -213,12 +273,16 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`}\n` +
 		`\n` +
 		`CLI=""\n` +
+		`NATIVE=""\n` +
 		`CHOSEN_VER=""\n` +
+		`WANT_HAS_SIDECAR=""\n` +
 		`if [ -n "$WANT" ]; then\n` +
 		`\tCAND=$(sidecar_js "$WANT")\n` +
-		`\tif is_patched "$CAND"; then CLI="$CAND"; CHOSEN_VER="$WANT"; fi\n` +
+		`\t[ -f "$CAND" ] && WANT_HAS_SIDECAR=1\n` +
+		`\tif native_fresh "$WANT"; then NATIVE=$(sidecar_native "$WANT"); fi\n` +
+		`\tif [ -n "$NATIVE" ] || is_patched "$CAND"; then CLI="$CAND"; CHOSEN_VER="$WANT"; fi\n` +
 		`fi\n` +
-		`if [ -z "$CLI" ]; then\n` +
+		`if [ -z "$CLI" ] && [ -z "$WANT_HAS_SIDECAR" ]; then\n` +
 		`\t# No usable sidecar for the installed version: apply has not been re-run\n` +
 		`\t# since the upgrade. Use the newest sidecar that actually carries the\n` +
 		`\t# patch so the UI stays Chinese instead of dropping to English — and say\n` +
@@ -228,19 +292,22 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`\tfor DIR in "$RUNTIME_ROOT"/*/; do\n` +
 		`\t\t[ -d "$DIR" ] || continue\n` +
 		`\t\tV=$(basename "$DIR")\n` +
-		`\t\tis_patched "$(sidecar_js "$V")" || continue\n` +
+		`\t\tif native_fresh "$V" || is_patched "$(sidecar_js "$V")"; then :; else continue; fi\n` +
 		`\t\tif [ -z "$BEST_VER" ] || [ "$(newer_than "$V" "$BEST_VER")" = 1 ]; then\n` +
 		`\t\t\tBEST_VER="$V"\n` +
 		`\t\tfi\n` +
 		`\tdone\n` +
-		`\tif [ -n "$BEST_VER" ]; then CLI=$(sidecar_js "$BEST_VER"); CHOSEN_VER="$BEST_VER"; fi\n` +
+		`\tif [ -n "$BEST_VER" ]; then\n` +
+		`\t\tCLI=$(sidecar_js "$BEST_VER"); CHOSEN_VER="$BEST_VER"\n` +
+		`\t\tif native_fresh "$BEST_VER"; then NATIVE=$(sidecar_native "$BEST_VER"); fi\n` +
+		`\tfi\n` +
 		`fi\n` +
 		`[ -n "$CLI" ] || CLI="$FALLBACK"\n` +
 		`\n` +
 		`# Braces are required around any variable followed by a CJK glyph: bash\n` +
 		`# reads the leading byte of a multibyte character as part of the name and\n` +
 		`# silently truncates the value.\n` +
-		`if [ -n "$WANT" ] && [ "$CHOSEN_VER" != "$WANT" ]; then\n` +
+		`if [ -n "$WANT" ] && [ -z "$WANT_HAS_SIDECAR" ] && [ "$CHOSEN_VER" != "$WANT" ]; then\n` +
 		`\tif [ -n "$CHOSEN_VER" ]; then\n` +
 		`\t\techo "omp-zh: 官方 omp 已是 \${WANT}，当前运行的是 \${CHOSEN_VER} 的汉化运行时。" >&2\n` +
 		`\telse\n` +
@@ -248,6 +315,8 @@ const writeLauncher = async (cli: string): Promise<string> => {
 		`\tfi\n` +
 		`\techo "        请重跑：\${HOME}/.omp-zh/omp-zh.sh apply" >&2\n` +
 		`fi\n` +
+		`# Prefer the bytecode binary; fall back to bun reading the JS bundle.\n` +
+		`if [ -n "$NATIVE" ]; then exec "$NATIVE" "$@"; fi\n` +
 		`exec "$BUN" "$CLI" "$@"\n`;
 	await Bun.write(launcher, body);
 	await fs.chmod(launcher, 0o755);
@@ -1973,6 +2042,19 @@ const apply = async (): Promise<void> => {
 	console.log(`patched ${ops.length} literal sites + ${anchorOps.length} anchor sites (${manifest.keys.length} keys)`);
 	console.log(`size ${(code.length / 1e6).toFixed(2)}MB → ${(out.length / 1e6).toFixed(2)}MB`);
 	console.log(`backup → ${backupPath}`);
+
+	// Sidecar installs run through the `omp-zh` launcher, which prefers a
+	// precompiled binary when one is present and fresh. Rebuild it here so a
+	// fresh order of `apply` always leaves the fast path in place; a failure is
+	// reported and the launcher silently keeps using the JS bundle.
+	if (TARGET.kind === "sidecar" && TARGET.version) {
+		// A previously compiled binary predates this patch, so it must go
+		// before anything checks freshness, or it would keep serving the old
+		// UI and shadow the bundle we just wrote.
+		const stale = nativeBinaryPath(TARGET.version);
+		if (existsSync(stale)) await fs.rm(stale, { force: true });
+		await compileNative(CLI_PATH, TARGET.version);
+	}
 };
 
 const verify = async (): Promise<void> => {
@@ -2144,6 +2226,18 @@ const restore = async (): Promise<void> => {
 	await Bun.write(CLI_PATH, data);
 	await fs.chmod(CLI_PATH, mode);
 	console.log(`restored ${(data.length / 1e6).toFixed(2)}MB from ${newest}`);
+
+	// The precompiled binary embeds the patched bundle, so leaving it behind
+	// would keep serving the Chinese UI after a "restore to English" — the
+	// launcher prefers it whenever it is newer than cli.js. Remove it so both
+	// paths agree on the restored (English) bundle.
+	if (TARGET.kind === "sidecar" && TARGET.version) {
+		const stale = nativeBinaryPath(TARGET.version);
+		if (existsSync(stale)) {
+			await fs.rm(stale, { force: true });
+			console.log(`removed precompiled binary (it embedded the patched bundle): ${stale}`);
+		}
+	}
 };
 
 const listBackups = async (): Promise<void> => {
@@ -2442,6 +2536,14 @@ if (command === "doctor") {
 } else
 if (command === "report") await report();
 else if (command === "apply") await apply();
+else if (command === "native") {
+	if (TARGET.kind !== "sidecar" || !TARGET.version) {
+		console.error("native: 仅二进制安装（侧载）需要预编译，就地安装的 JS 产物已是最优路径");
+		process.exit(1);
+	}
+	const built = await compileNative(CLI_PATH, TARGET.version);
+	if (!built) process.exit(1);
+}
 else if (command === "verify") await verify();
 else if (command === "restore") await restore();
 else if (command === "list") await listBackups();
@@ -2459,6 +2561,6 @@ else if (command === "probe") {
 	}
 }
 else {
-	console.error(`unknown command: ${command} (report|apply|verify|restore|list|probe|path|check|migrate|doctor)`);
+	console.error(`unknown command: ${command} (report|apply|verify|restore|list|probe|path|check|migrate|doctor|native)`);
 	process.exit(1);
 }
